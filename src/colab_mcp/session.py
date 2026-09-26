@@ -39,6 +39,7 @@ PROXY_PORT_KEY = "proxy_port"
 INJECTED_TOOL_NAME = "open_colab_browser_connection"
 
 GET_OUTPUT_CELL_TOOL_NAME = "get_output_cell"
+WAIT_CELL_OUTPUT_TOOL_NAME = "wait_cell_output"
 NOT_CONNECTED_MSG = (
     "Not connected to a Colab session. Call 'open_colab_browser_connection' first."
 )
@@ -288,6 +289,104 @@ def make_get_output_cell_tool(proxy_client: ColabProxyClient) -> Tool:
     )
 
 
+def make_wait_cell_output_fn(proxy_client: ColabProxyClient):
+    """Build the ``wait_cell_output`` tool fn.
+
+    Polls a cell's state (read-only, via ``get_cells``) until the kernel has
+    finished executing it, then returns its complete output. A cell is "busy"
+    while its ``execution_count`` is ``null`` (the kernel is still running it)
+    and "idle" once ``execution_count`` becomes an integer. This lets an agent
+    wait for a long-running cell (e.g. training) to actually finish on the
+    Colab kernel even though ``run_code_cell`` returned early at the client's
+    ~60s timeout, without adding cells or re-running anything.
+    """
+
+    async def wait_cell_output_fn(
+        cellId: str = "",
+        cellIndex: int = -1,
+        poll_interval: float = 5.0,
+        max_wait: float = 3600.0,
+    ) -> str:
+        if not proxy_client.is_connected() or proxy_client.proxy_mcp_client is None:
+            return NOT_CONNECTED_MSG
+        if not cellId and cellIndex < 0:
+            return NO_CELL_MSG
+
+        client = proxy_client.proxy_mcp_client
+        import time
+
+        # Resolve the cell's index once, so each poll can request only that
+        # single cell instead of the whole notebook.
+        idx = cellIndex
+        if idx < 0:
+            all_result = await client.call_tool("get_cells", {})
+            all_payload = _extract_result_json(all_result)
+            all_cells = all_payload.get("cells", [])
+            if not isinstance(all_cells, list):
+                all_cells = []
+            idx = next(
+                (i for i, c in enumerate(all_cells) if c.get("id") == cellId),
+                -1,
+            )
+            if idx < 0:
+                return f"Cell with id '{cellId}' was not found in the notebook."
+
+        start = time.monotonic()
+        while True:
+            # Fetch just this one cell via an index range.
+            result = await client.call_tool(
+                "get_cells",
+                {
+                    "includeOutputs": True,
+                    "cellIndexStart": idx,
+                    "cellIndexEnd": idx + 1,
+                },
+            )
+            payload = _extract_result_json(result)
+            cells = payload.get("cells", [])
+            if not isinstance(cells, list) or not cells:
+                return "Could not read the cell's state."
+            target = cells[0]
+
+            # Idle signal: execution_count is an integer (not null).
+            if target.get("execution_count") is not None:
+                outputs = target.get("outputs") or []
+                return json.dumps(
+                    {
+                        "cellId": target.get("id"),
+                        "cell_type": target.get("cell_type"),
+                        "outputs": outputs,
+                    },
+                    indent=2,
+                )
+
+            if time.monotonic() - start > max_wait:
+                return (
+                    "Cell is still executing after "
+                    f"{max_wait:.0f}s. Call again to keep waiting."
+                )
+
+            await asyncio.sleep(poll_interval)
+
+    return wait_cell_output_fn
+
+
+def make_wait_cell_output_tool(proxy_client: ColabProxyClient) -> Tool:
+    return Tool.from_function(
+        fn=make_wait_cell_output_fn(proxy_client),
+        name=WAIT_CELL_OUTPUT_TOOL_NAME,
+        description=(
+            "Waits (polls read-only) until a Colab cell has finished executing "
+            "on the kernel, then returns its complete output. Identify the cell "
+            "by 'cellId' (preferred) or 'cellIndex' (0-based). A cell is "
+            "considered done when its execution_count is set (no longer null). "
+            "Use this after run_code_cell returns early (client ~60s timeout) "
+            "to block until the cell's real work (e.g. training) completes, "
+            "without adding cells or re-running."
+        ),
+    )
+
+
 class ColabSessionProxy:
     def __init__(self):
         self._exit_stack = AsyncExitStack()
@@ -312,6 +411,7 @@ class ColabSessionProxy:
                 tools=[
                     check_session_proxy_tool,
                     make_get_output_cell_tool(proxy_client),
+                    make_wait_cell_output_tool(proxy_client),
                 ]
             )
         )
