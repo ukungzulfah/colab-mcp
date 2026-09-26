@@ -30,6 +30,22 @@ Popular clients that fit these criteria include:
 
 (If you have a non-standard default package index (**Googlers**), you may also need to add `--index https://pypi.org/simple`)
 
+# Reading cell outputs without re-running
+
+The proxied Colab tools do not include a dedicated "get output" tool, and
+`get_cells` hides outputs by default. This server injects an extra local tool,
+`get_output_cell`, which reads the execution outputs (stdout, results, errors)
+of an existing cell **without re-running it**:
+
+```
+Agent: get_output_cell(cellId="abc123")
+> { "cellId": "abc123", "cell_type": "code", "outputs": [ ... ] }
+```
+
+Identify the cell either by `cellId` (preferred) or by 0-based `cellIndex`.
+This is useful after `run_code_cell` returns, including for output produced by a
+long-running cell whose tool response was cut off before the cell finished.
+
 # Issues & Discussions
 
 We are using GitHub [discussions](https://github.com/googlecolab/colab-mcp/discussions) as the

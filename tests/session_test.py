@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 from colab_mcp import session
 from fastmcp.server.middleware import MiddlewareContext
 import pytest
@@ -172,6 +173,93 @@ class TestCheckSessionProxyToolFn:
         args, _ = mock_webbrowser.call_args
         assert "mcpProxyToken=test-token" in args[0]
         assert "mcpProxyPort=1234" in args[0]
+
+
+class TestGetOutputCell:
+    def _client_with_cells(self, cells, connected=True):
+        proxy_client = Mock()
+        proxy_client.is_connected.return_value = connected
+        if connected:
+            proxy_mcp_client = Mock()
+            result = Mock()
+            # real frontend shape: data is a JSON *string*, not a dict
+            result.data = json.dumps({"cells": cells})
+            result.structured_content = None
+            result.content = []
+            proxy_mcp_client.call_tool = AsyncMock(return_value=result)
+            proxy_client.proxy_mcp_client = proxy_mcp_client
+        else:
+            proxy_client.proxy_mcp_client = None
+        return proxy_client
+
+    @pytest.mark.asyncio
+    async def test_get_output_by_cell_id(self):
+        cells = [
+            {"id": "a", "cell_type": "code", "outputs": []},
+            {
+                "id": "b",
+                "cell_type": "code",
+                "outputs": [
+                    {"output_type": "stream", "name": "stdout", "text": ["hi\n"]}
+                ],
+            },
+        ]
+        proxy_client = self._client_with_cells(cells)
+        fn = session.make_get_output_cell_fn(proxy_client)
+        out = json.loads(await fn(cellId="b"))
+        assert out["cellId"] == "b"
+        assert out["outputs"][0]["text"] == ["hi\n"]
+
+    @pytest.mark.asyncio
+    async def test_get_output_by_index(self):
+        cells = [{"id": "a", "cell_type": "code", "outputs": [{"x": 1}]}]
+        proxy_client = self._client_with_cells(cells)
+        fn = session.make_get_output_cell_fn(proxy_client)
+        out = json.loads(await fn(cellIndex=0))
+        assert out["cellId"] == "a"
+        assert out["outputs"] == [{"x": 1}]
+
+    @pytest.mark.asyncio
+    async def test_get_output_not_connected(self):
+        proxy_client = self._client_with_cells([], connected=False)
+        fn = session.make_get_output_cell_fn(proxy_client)
+        assert await fn(cellId="a") == session.NOT_CONNECTED_MSG
+
+    @pytest.mark.asyncio
+    async def test_get_output_missing_selector(self):
+        proxy_client = self._client_with_cells([])
+        fn = session.make_get_output_cell_fn(proxy_client)
+        assert await fn() == session.NO_CELL_MSG
+
+    @pytest.mark.asyncio
+    async def test_get_output_unknown_id(self):
+        proxy_client = self._client_with_cells([{"id": "a", "outputs": []}])
+        fn = session.make_get_output_cell_fn(proxy_client)
+        assert "not found" in await fn(cellId="zzz")
+
+    @pytest.mark.asyncio
+    async def test_get_output_index_out_of_range(self):
+        proxy_client = self._client_with_cells([{"id": "a", "outputs": []}])
+        fn = session.make_get_output_cell_fn(proxy_client)
+        assert "out of range" in await fn(cellIndex=5)
+
+    @pytest.mark.asyncio
+    async def test_get_output_parses_text_content(self):
+        """Falls back to parsing the first text content block when data is absent."""
+        proxy_client = Mock()
+        proxy_client.is_connected.return_value = True
+        result = Mock()
+        result.data = None
+        result.structured_content = None
+        result.content = [
+            Mock(text=json.dumps({"cells": [{"id": "a", "outputs": [{"x": 2}]}]}))
+        ]
+        proxy_mcp_client = Mock()
+        proxy_mcp_client.call_tool = AsyncMock(return_value=result)
+        proxy_client.proxy_mcp_client = proxy_mcp_client
+        fn = session.make_get_output_cell_fn(proxy_client)
+        out = json.loads(await fn(cellId="a"))
+        assert out["outputs"] == [{"x": 2}]
 
 
 class TestColabProxyClient:
