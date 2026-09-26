@@ -39,7 +39,7 @@ class ColabWebSocketServer:
     from a Google Colab session (colab.google.com).
     """
 
-    def __init__(self, host="localhost"):
+    def __init__(self, host="127.0.0.1"):
         self.host = host
         self.port = 0
         self.connection_lock = asyncio.Lock()
